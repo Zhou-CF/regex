@@ -1,0 +1,690 @@
+From d2ab289294f5eaa175e6bc4ab5fb74b5ea013f6e Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?Fran=C3=A7ois=20Saint-Jacques?= <fsaintjacques@gmail.com>
+Date: Tue, 25 Feb 2020 16:41:35 +0100
+Subject: [PATCH] PARQUET-1797: [C++] Fix fuzzer issues
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Closes #6440 from fsaintjacques/PARQUET-1797-fuzzer-issues and squashes the following commits:
+
+168e62ad9 <François Saint-Jacques> Address review comments
+85c2168a0 <François Saint-Jacques> Fix decryptor nullptr deref
+8fbf3ec55 <François Saint-Jacques> Fix dict issues and vlq undefined behaviour
+c849c4dcc <François Saint-Jacques> Refactor RleDecoder
+7fe6d252b <François Saint-Jacques> Add dict bounds
+d0f41dca2 <François Saint-Jacques> PARQUET-1797:  Fixes fuzzer issues
+
+Authored-by: François Saint-Jacques <fsaintjacques@gmail.com>
+Signed-off-by: Antoine Pitrou <antoine@python.org>
+---
+ ci/scripts/cpp_test.sh                |   3 +
+ cpp/src/arrow/util/bit_stream_utils.h |  73 ++++++++------
+ cpp/src/arrow/util/bit_util_test.cc   |   2 +-
+ cpp/src/arrow/util/rle_encoding.h     | 138 ++++++++++++++++++--------
+ cpp/src/parquet/column_reader.cc      |   3 +
+ cpp/src/parquet/encoding.cc           |  99 +++++++++++-------
+ cpp/src/parquet/file_reader.cc        |   6 +-
+ testing                               |   2 +-
+ 8 files changed, 212 insertions(+), 114 deletions(-)
+
+diff --git a/ci/scripts/cpp_test.sh b/ci/scripts/cpp_test.sh
+index 16f0cd24d0..ca8addc74b 100755
+--- a/ci/scripts/cpp_test.sh
++++ b/ci/scripts/cpp_test.sh
+@@ -49,6 +49,9 @@ if [ "${ARROW_FUZZING}" == "ON" ]; then
+     ${binary_output_dir}/arrow-ipc-stream-fuzz ${ARROW_TEST_DATA}/arrow-ipc-stream/crash-*
+     ${binary_output_dir}/arrow-ipc-stream-fuzz ${ARROW_TEST_DATA}/arrow-ipc-stream/*-testcase-*
+     ${binary_output_dir}/arrow-ipc-file-fuzz ${ARROW_TEST_DATA}/arrow-ipc-file/*-testcase-*
++    if [ "${ARROW_PARQUET}" == "ON" ]; then
++      ${binary_output_dir}/parquet-arrow-fuzz ${ARROW_TEST_DATA}/parquet/fuzzing/*-testcase-*
++    fi
+ fi
+ 
+ popd
+diff --git a/cpp/src/arrow/util/bit_stream_utils.h b/cpp/src/arrow/util/bit_stream_utils.h
+index 996a6bb751..b9588c0292 100644
+--- a/cpp/src/arrow/util/bit_stream_utils.h
++++ b/cpp/src/arrow/util/bit_stream_utils.h
+@@ -146,7 +146,7 @@ class BitReader {
+   /// Reads a vlq encoded int from the stream.  The encoded int must start at
+   /// the beginning of a byte. Return false if there were not enough bytes in
+   /// the buffer.
+-  bool GetVlqInt(int32_t* v);
++  bool GetVlqInt(uint32_t* v);
+ 
+   // Reads a zigzag encoded int `into` v.
+   bool GetZigZagVlqInt(int32_t* v);
+@@ -159,7 +159,7 @@ class BitReader {
+   }
+ 
+   /// Maximum byte length of a vlq encoded int
+-  static const int MAX_VLQ_BYTE_LEN = 5;
++  static constexpr int kMaxVlqByteLength = 5;
+ 
+  private:
+   const uint8_t* buffer_;
+@@ -225,16 +225,6 @@ inline bool BitWriter::PutAligned(T val, int num_bytes) {
+   return true;
+ }
+ 
+-inline bool BitWriter::PutVlqInt(uint32_t v) {
+-  bool result = true;
+-  while ((v & 0xFFFFFF80) != 0L) {
+-    result &= PutAligned<uint8_t>(static_cast<uint8_t>((v & 0x7F) | 0x80), 1);
+-    v >>= 7;
+-  }
+-  result &= PutAligned<uint8_t>(static_cast<uint8_t>(v & 0x7F), 1);
+-  return result;
+-}
+-
+ namespace detail {
+ 
+ template <typename T>
+@@ -361,10 +351,14 @@ inline int BitReader::GetBatch(int num_bits, T* v, int batch_size) {
+ 
+ template <typename T>
+ inline bool BitReader::GetAligned(int num_bytes, T* v) {
+-  DCHECK_LE(num_bytes, static_cast<int>(sizeof(T)));
++  if (ARROW_PREDICT_FALSE(num_bytes > static_cast<int>(sizeof(T)))) {
++    return false;
++  }
++
+   int bytes_read = static_cast<int>(BitUtil::BytesForBits(bit_offset_));
+-  if (ARROW_PREDICT_FALSE(byte_offset_ + bytes_read + num_bytes > max_bytes_))
++  if (ARROW_PREDICT_FALSE(byte_offset_ + bytes_read + num_bytes > max_bytes_)) {
+     return false;
++  }
+ 
+   // Advance byte_offset to next unread byte and read num_bytes
+   byte_offset_ += bytes_read;
+@@ -382,31 +376,44 @@ inline bool BitReader::GetAligned(int num_bytes, T* v) {
+   return true;
+ }
+ 
+-inline bool BitReader::GetVlqInt(int32_t* v) {
+-  *v = 0;
+-  int shift = 0;
+-  int num_bytes = 0;
+-  uint8_t byte = 0;
+-  do {
+-    if (!GetAligned<uint8_t>(1, &byte)) return false;
+-    *v |= (byte & 0x7F) << shift;
+-    shift += 7;
+-    DCHECK_LE(++num_bytes, MAX_VLQ_BYTE_LEN);
+-  } while ((byte & 0x80) != 0);
+-  return true;
++inline bool BitWriter::PutVlqInt(uint32_t v) {
++  bool result = true;
++  while ((v & 0xFFFFFF80UL) != 0UL) {
++    result &= PutAligned<uint8_t>(static_cast<uint8_t>((v & 0x7F) | 0x80), 1);
++    v >>= 7;
++  }
++  result &= PutAligned<uint8_t>(static_cast<uint8_t>(v & 0x7F), 1);
++  return result;
++}
++
++inline bool BitReader::GetVlqInt(uint32_t* v) {
++  uint32_t tmp = 0;
++
++  for (int i = 0; i < kMaxVlqByteLength; i++) {
++    uint8_t byte = 0;
++    if (ARROW_PREDICT_FALSE(!GetAligned<uint8_t>(1, &byte))) {
++      return false;
++    }
++    tmp |= static_cast<uint32_t>(byte & 0x7F) << (7 * i);
++
++    if ((byte & 0x80) == 0) {
++      *v = tmp;
++      return true;
++    }
++  }
++
++  return false;
+ }
+ 
+ inline bool BitWriter::PutZigZagVlqInt(int32_t v) {
+-  // Note negative left shift is undefined
+-  uint32_t u = (static_cast<uint32_t>(v) << 1) ^ (v >> 31);
+-  return PutVlqInt(u);
++  auto u_v = ::arrow::util::SafeCopy<uint32_t>(v);
++  return PutVlqInt((u_v << 1) ^ (u_v >> 31));
+ }
+ 
+ inline bool BitReader::GetZigZagVlqInt(int32_t* v) {
+-  int32_t u_signed;
+-  if (!GetVlqInt(&u_signed)) return false;
+-  uint32_t u = static_cast<uint32_t>(u_signed);
+-  *reinterpret_cast<uint32_t*>(v) = (u >> 1) ^ -(static_cast<int32_t>(u & 1));
++  uint32_t u;
++  if (!GetVlqInt(&u)) return false;
++  *v = ::arrow::util::SafeCopy<int32_t>((u >> 1) ^ (u << 31));
+   return true;
+ }
+ 
+diff --git a/cpp/src/arrow/util/bit_util_test.cc b/cpp/src/arrow/util/bit_util_test.cc
+index b8b1e93c69..fde12d3986 100644
+--- a/cpp/src/arrow/util/bit_util_test.cc
++++ b/cpp/src/arrow/util/bit_util_test.cc
+@@ -1056,7 +1056,7 @@ TEST(BitUtil, RoundUpToPowerOf2) {
+ #undef S64
+ 
+ static void TestZigZag(int32_t v) {
+-  uint8_t buffer[BitUtil::BitReader::MAX_VLQ_BYTE_LEN] = {};
++  uint8_t buffer[BitUtil::BitReader::kMaxVlqByteLength] = {};
+   BitUtil::BitWriter writer(buffer, sizeof(buffer));
+   BitUtil::BitReader reader(buffer, sizeof(buffer));
+   writer.PutZigZagVlqInt(v);
+diff --git a/cpp/src/arrow/util/rle_encoding.h b/cpp/src/arrow/util/rle_encoding.h
+index 6391f5a6c1..1e97ffe369 100644
+--- a/cpp/src/arrow/util/rle_encoding.h
++++ b/cpp/src/arrow/util/rle_encoding.h
+@@ -21,8 +21,9 @@
+ #ifndef ARROW_UTIL_RLE_ENCODING_H
+ #define ARROW_UTIL_RLE_ENCODING_H
+ 
+-#include <math.h>
+ #include <algorithm>
++#include <cmath>
++#include <vector>
+ 
+ #include "arrow/util/bit_stream_utils.h"
+ #include "arrow/util/bit_util.h"
+@@ -123,15 +124,16 @@ class RleDecoder {
+ 
+   /// Like GetBatch but the values are then decoded using the provided dictionary
+   template <typename T>
+-  int GetBatchWithDict(const T* dictionary, T* values, int batch_size);
++  int GetBatchWithDict(const T* dictionary, int32_t dictionary_length, T* values,
++                       int batch_size);
+ 
+   /// Like GetBatchWithDict but add spacing for null entries
+   ///
+   /// Null entries will be zero-initialized in `values` to avoid leaking
+   /// private data.
+   template <typename T>
+-  int GetBatchWithDictSpaced(const T* dictionary, T* values, int batch_size,
+-                             int null_count, const uint8_t* valid_bits,
++  int GetBatchWithDictSpaced(const T* dictionary, int32_t dictionary_length, T* values,
++                             int batch_size, int null_count, const uint8_t* valid_bits,
+                              int64_t valid_bits_offset);
+ 
+  protected:
+@@ -180,8 +182,8 @@ class RleEncoder {
+     int max_literal_run_size =
+         1 +
+         static_cast<int>(BitUtil::BytesForBits(MAX_VALUES_PER_LITERAL_RUN * bit_width));
+-    /// Up to MAX_VLQ_BYTE_LEN indicator and a single 'bit_width' value.
+-    int max_repeated_run_size = BitUtil::BitReader::MAX_VLQ_BYTE_LEN +
++    /// Up to kMaxVlqByteLength indicator and a single 'bit_width' value.
++    int max_repeated_run_size = BitUtil::BitReader::kMaxVlqByteLength +
+                                 static_cast<int>(BitUtil::BytesForBits(bit_width));
+     return std::max(max_literal_run_size, max_repeated_run_size);
+   }
+@@ -294,22 +296,28 @@ inline int RleDecoder::GetBatch(T* values, int batch_size) {
+   DCHECK_GE(bit_width_, 0);
+   int values_read = 0;
+ 
++  auto* out = values;
++
+   while (values_read < batch_size) {
++    int remaining = batch_size - values_read;
++
+     if (repeat_count_ > 0) {
+-      int repeat_batch =
+-          std::min(batch_size - values_read, static_cast<int>(repeat_count_));
+-      std::fill(values + values_read, values + values_read + repeat_batch,
+-                static_cast<T>(current_value_));
++      int repeat_batch = std::min(remaining, static_cast<int>(repeat_count_));
++      std::fill(out, out + repeat_batch, static_cast<T>(current_value_));
++
+       repeat_count_ -= repeat_batch;
+       values_read += repeat_batch;
++      out += repeat_batch;
+     } else if (literal_count_ > 0) {
+-      int literal_batch =
+-          std::min(batch_size - values_read, static_cast<int>(literal_count_));
+-      int actual_read =
+-          bit_reader_.GetBatch(bit_width_, values + values_read, literal_batch);
+-      DCHECK_EQ(actual_read, literal_batch);
++      int literal_batch = std::min(remaining, static_cast<int>(literal_count_));
++      int actual_read = bit_reader_.GetBatch(bit_width_, out, literal_batch);
++      if (actual_read != literal_batch) {
++        return values_read;
++      }
++
+       literal_count_ -= literal_batch;
+       values_read += literal_batch;
++      out += literal_batch;
+     } else {
+       if (!NextCounts<T>()) return values_read;
+     }
+@@ -394,33 +402,59 @@ inline int RleDecoder::GetBatchSpaced(int batch_size, int null_count,
+   return values_read;
+ }
+ 
++static inline bool IndexInRange(int32_t idx, int32_t dictionary_length) {
++  return idx >= 0 && idx < dictionary_length;
++}
++
+ template <typename T>
+-inline int RleDecoder::GetBatchWithDict(const T* dictionary, T* values, int batch_size) {
++inline int RleDecoder::GetBatchWithDict(const T* dictionary, int32_t dictionary_length,
++                                        T* values, int batch_size) {
+   DCHECK_GE(bit_width_, 0);
+   int values_read = 0;
+ 
++  auto* out = values;
++
+   while (values_read < batch_size) {
++    int remaining = batch_size - values_read;
++
+     if (repeat_count_ > 0) {
+-      int repeat_batch =
+-          std::min(batch_size - values_read, static_cast<int>(repeat_count_));
+-      std::fill(values + values_read, values + values_read + repeat_batch,
+-                dictionary[current_value_]);
++      auto idx = static_cast<int32_t>(current_value_);
++      if (ARROW_PREDICT_FALSE(!IndexInRange(idx, dictionary_length))) {
++        return values_read;
++      }
++      T val = dictionary[idx];
++
++      int repeat_batch = std::min(remaining, static_cast<int>(repeat_count_));
++      std::fill(out, out + repeat_batch, val);
++
++      /* Upkeep counters */
+       repeat_count_ -= repeat_batch;
+       values_read += repeat_batch;
++      out += repeat_batch;
+     } else if (literal_count_ > 0) {
+-      int literal_batch =
+-          std::min(batch_size - values_read, static_cast<int>(literal_count_));
+-
+-      const int buffer_size = 1024;
+-      int indices[buffer_size];
+-      literal_batch = std::min(literal_batch, buffer_size);
+-      int actual_read = bit_reader_.GetBatch(bit_width_, &indices[0], literal_batch);
+-      DCHECK_EQ(actual_read, literal_batch);
++      constexpr int kBufferSize = 1024;
++      int indices[kBufferSize];
++
++      int literal_batch = std::min(remaining, static_cast<int>(literal_count_));
++      literal_batch = std::min(literal_batch, kBufferSize);
++
++      int actual_read = bit_reader_.GetBatch(bit_width_, indices, literal_batch);
++      if (ARROW_PREDICT_FALSE(actual_read != literal_batch)) {
++        return values_read;
++      }
++
+       for (int i = 0; i < literal_batch; ++i) {
+-        values[values_read + i] = dictionary[indices[i]];
++        int index = indices[i];
++        if (ARROW_PREDICT_FALSE(!IndexInRange(index, dictionary_length))) {
++          return values_read;
++        }
++        out[i] = dictionary[index];
+       }
++
++      /* Upkeep counters */
+       literal_count_ -= literal_batch;
+       values_read += literal_batch;
++      out += literal_batch;
+     } else {
+       if (!NextCounts<T>()) return values_read;
+     }
+@@ -430,8 +464,10 @@ inline int RleDecoder::GetBatchWithDict(const T* dictionary, T* values, int batc
+ }
+ 
+ template <typename T>
+-inline int RleDecoder::GetBatchWithDictSpaced(const T* dictionary, T* out, int batch_size,
+-                                              int null_count, const uint8_t* valid_bits,
++inline int RleDecoder::GetBatchWithDictSpaced(const T* dictionary,
++                                              int32_t dictionary_length, T* out,
++                                              int batch_size, int null_count,
++                                              const uint8_t* valid_bits,
+                                               int64_t valid_bits_offset) {
+   DCHECK_GE(bit_width_, 0);
+   int values_read = 0;
+@@ -449,7 +485,11 @@ inline int RleDecoder::GetBatchWithDictSpaced(const T* dictionary, T* out, int b
+         if (!NextCounts<T>()) return values_read;
+       }
+       if (repeat_count_ > 0) {
+-        T value = dictionary[current_value_];
++        auto idx = static_cast<int32_t>(current_value_);
++        if (ARROW_PREDICT_FALSE(!IndexInRange(idx, dictionary_length))) {
++          return values_read;
++        }
++        T value = dictionary[idx];
+         // The current index is already valid, we don't need to check that again
+         int repeat_batch = 1;
+         repeat_count_--;
+@@ -476,16 +516,25 @@ inline int RleDecoder::GetBatchWithDictSpaced(const T* dictionary, T* out, int b
+         int indices[kBufferSize];
+         literal_batch = std::min(literal_batch, kBufferSize);
+         int actual_read = bit_reader_.GetBatch(bit_width_, &indices[0], literal_batch);
+-        DCHECK_EQ(actual_read, literal_batch);
++        if (actual_read != literal_batch) return values_read;
+ 
+         int skipped = 0;
+         int literals_read = 1;
+-        *out++ = dictionary[indices[0]];
++
++        int first_idx = indices[0];
++        if (ARROW_PREDICT_FALSE(!IndexInRange(first_idx, dictionary_length))) {
++          return values_read;
++        }
++        *out++ = dictionary[first_idx];
+ 
+         // Read the first bitset to the end
+         while (literals_read < literal_batch) {
+           if (bit_reader.IsSet()) {
+-            *out = dictionary[indices[literals_read]];
++            int idx = indices[literals_read];
++            if (ARROW_PREDICT_FALSE(!IndexInRange(idx, dictionary_length))) {
++              return values_read;
++            }
++            *out = dictionary[idx];
+             literals_read++;
+           } else {
+             *out = zero;
+@@ -513,21 +562,22 @@ template <typename T>
+ bool RleDecoder::NextCounts() {
+   // Read the next run's indicator int, it could be a literal or repeated run.
+   // The int is encoded as a vlq-encoded value.
+-  int32_t indicator_value = 0;
+-  bool result = bit_reader_.GetVlqInt(&indicator_value);
+-  if (!result) return false;
++  uint32_t indicator_value = 0;
++  if (!bit_reader_.GetVlqInt(&indicator_value)) return false;
+ 
+   // lsb indicates if it is a literal run or repeated run
+   bool is_literal = indicator_value & 1;
++  uint32_t count = indicator_value >> 1;
+   if (is_literal) {
+-    literal_count_ = (indicator_value >> 1) * 8;
++    if (count > UINT32_MAX / 8) return false;
++    literal_count_ = count * 8;
+   } else {
+-    repeat_count_ = indicator_value >> 1;
++    repeat_count_ = count;
+     // XXX (ARROW-4018) this is not big-endian compatible
+-    bool result =
+-        bit_reader_.GetAligned<T>(static_cast<int>(BitUtil::CeilDiv(bit_width_, 8)),
+-                                  reinterpret_cast<T*>(&current_value_));
+-    DCHECK(result);
++    if (!bit_reader_.GetAligned<T>(static_cast<int>(BitUtil::CeilDiv(bit_width_, 8)),
++                                   reinterpret_cast<T*>(&current_value_))) {
++      return false;
++    }
+   }
+   return true;
+ }
+diff --git a/cpp/src/parquet/column_reader.cc b/cpp/src/parquet/column_reader.cc
+index 61733fb059..f6e9275329 100644
+--- a/cpp/src/parquet/column_reader.cc
++++ b/cpp/src/parquet/column_reader.cc
+@@ -63,6 +63,9 @@ int LevelDecoder::SetData(Encoding::type encoding, int16_t max_level,
+   switch (encoding) {
+     case Encoding::RLE: {
+       num_bytes = ::arrow::util::SafeLoadAs<int32_t>(data);
++      if (num_bytes < 0) {
++        throw ParquetException("Received invalid number of bytes");
++      }
+       const uint8_t* decoder_data = data + sizeof(int32_t);
+       if (!rle_decoder_) {
+         rle_decoder_.reset(
+diff --git a/cpp/src/parquet/encoding.cc b/cpp/src/parquet/encoding.cc
+index 150fc18693..369b8ead63 100644
+--- a/cpp/src/parquet/encoding.cc
++++ b/cpp/src/parquet/encoding.cc
+@@ -1429,8 +1429,15 @@ class PlainByteArrayDecoder : public PlainDecoder<ByteArrayType>,
+         std::min<int64_t>(len_, helper.chunk_space_remaining)));
+     for (int i = 0; i < num_values; ++i) {
+       if (bit_reader.IsSet()) {
+-        auto value_len = static_cast<int32_t>(arrow::util::SafeLoadAs<uint32_t>(data_));
+-        int increment = static_cast<int>(sizeof(uint32_t) + value_len);
++        // For compiler warnings on unsigned/signed arithmetic.
++        auto int32_s = static_cast<int32_t>(sizeof(int32_t));
++
++        auto value_len = arrow::util::SafeLoadAs<int32_t>(data_);
++        if (ARROW_PREDICT_FALSE(value_len < 0 || value_len > INT32_MAX - int32_s)) {
++          return Status::Invalid("Invalid or corrupted value_len '", value_len, "'");
++        }
++
++        auto increment = int32_s + value_len;
+         if (ARROW_PREDICT_FALSE(len_ < increment)) ParquetException::EofException();
+         if (ARROW_PREDICT_FALSE(!helper.CanFit(value_len))) {
+           // This element would exceed the capacity of a chunk
+@@ -1562,15 +1569,17 @@ class DictDecoderImpl : public DecoderImpl, virtual public DictDecoder<Type> {
+     num_values_ = num_values;
+     if (len == 0) return;
+     uint8_t bit_width = *data;
+-    ++data;
+-    --len;
+-    idx_decoder_ = arrow::util::RleDecoder(data, len, bit_width);
++    if (ARROW_PREDICT_FALSE(bit_width >= 64)) {
++      throw ParquetException("Invalid or corrupted bit_width");
++    }
++    idx_decoder_ = arrow::util::RleDecoder(++data, --len, bit_width);
+   }
+ 
+   int Decode(T* buffer, int num_values) override {
+     num_values = std::min(num_values, num_values_);
+-    int decoded_values = idx_decoder_.GetBatchWithDict(
+-        reinterpret_cast<const T*>(dictionary_->data()), buffer, num_values);
++    int decoded_values =
++        idx_decoder_.GetBatchWithDict(reinterpret_cast<const T*>(dictionary_->data()),
++                                      dictionary_length_, buffer, num_values);
+     if (decoded_values != num_values) {
+       ParquetException::EofException();
+     }
+@@ -1582,8 +1591,9 @@ class DictDecoderImpl : public DecoderImpl, virtual public DictDecoder<Type> {
+                    int64_t valid_bits_offset) override {
+     num_values = std::min(num_values, num_values_);
+     if (num_values != idx_decoder_.GetBatchWithDictSpaced(
+-                          reinterpret_cast<const T*>(dictionary_->data()), buffer,
+-                          num_values, null_count, valid_bits, valid_bits_offset)) {
++                          reinterpret_cast<const T*>(dictionary_->data()),
++                          dictionary_length_, buffer, num_values, null_count, valid_bits,
++                          valid_bits_offset)) {
+       ParquetException::EofException();
+     }
+     num_values_ -= num_values;
+@@ -1955,12 +1965,19 @@ class DictByteArrayDecoderImpl : public DictDecoderImpl<ByteArrayType>,
+   }
+ 
+  private:
++  Status IndexInBounds(int32_t index) {
++    if (ARROW_PREDICT_TRUE(0 <= index && index < dictionary_length_)) {
++      return Status::OK();
++    }
++    return Status::Invalid("Index not in dictionary bounds");
++  }
++
+   Status DecodeArrowDense(int num_values, int null_count, const uint8_t* valid_bits,
+                           int64_t valid_bits_offset,
+                           typename EncodingTraits<ByteArrayType>::Accumulator* out,
+                           int* out_num_values) {
+-    constexpr int32_t buffer_size = 1024;
+-    int32_t indices_buffer[buffer_size];
++    constexpr int32_t kBufferSize = 1024;
++    int32_t indices[kBufferSize];
+ 
+     ArrowBinaryHelper helper(out);
+ 
+@@ -1975,14 +1992,20 @@ class DictByteArrayDecoderImpl : public DictDecoderImpl<ByteArrayType>,
+ 
+       if (is_valid) {
+         int32_t batch_size =
+-            std::min<int32_t>(buffer_size, num_values - num_appended - null_count);
+-        int num_indices = idx_decoder_.GetBatch(indices_buffer, batch_size);
++            std::min<int32_t>(kBufferSize, num_values - num_appended - null_count);
++        int num_indices = idx_decoder_.GetBatch(indices, batch_size);
++
++        if (ARROW_PREDICT_FALSE(num_indices < 1)) {
++          return Status::Invalid("Invalid number of indices '", num_indices, "'");
++        }
+ 
+         int i = 0;
+         while (true) {
+           // Consume all indices
+           if (is_valid) {
+-            const auto& val = dict_values[indices_buffer[i]];
++            auto idx = indices[i];
++            RETURN_NOT_OK(IndexInBounds(idx));
++            const auto& val = dict_values[idx];
+             if (ARROW_PREDICT_FALSE(!helper.CanFit(val.len))) {
+               RETURN_NOT_OK(helper.PushChunk());
+             }
+@@ -2015,19 +2038,21 @@ class DictByteArrayDecoderImpl : public DictDecoderImpl<ByteArrayType>,
+   Status DecodeArrowDenseNonNull(int num_values,
+                                  typename EncodingTraits<ByteArrayType>::Accumulator* out,
+                                  int* out_num_values) {
+-    constexpr int32_t buffer_size = 2048;
+-    int32_t indices_buffer[buffer_size];
++    constexpr int32_t kBufferSize = 2048;
++    int32_t indices[kBufferSize];
+     int values_decoded = 0;
+ 
+     ArrowBinaryHelper helper(out);
+     auto dict_values = reinterpret_cast<const ByteArray*>(dictionary_->data());
+ 
+     while (values_decoded < num_values) {
+-      int32_t batch_size = std::min<int32_t>(buffer_size, num_values - values_decoded);
+-      int num_indices = idx_decoder_.GetBatch(indices_buffer, batch_size);
++      int32_t batch_size = std::min<int32_t>(kBufferSize, num_values - values_decoded);
++      int num_indices = idx_decoder_.GetBatch(indices, batch_size);
+       if (num_indices == 0) ParquetException::EofException();
+       for (int i = 0; i < num_indices; ++i) {
+-        const auto& val = dict_values[indices_buffer[i]];
++        auto idx = indices[i];
++        RETURN_NOT_OK(IndexInBounds(idx));
++        const auto& val = dict_values[idx];
+         if (ARROW_PREDICT_FALSE(!helper.CanFit(val.len))) {
+           RETURN_NOT_OK(helper.PushChunk());
+         }
+@@ -2043,8 +2068,8 @@ class DictByteArrayDecoderImpl : public DictDecoderImpl<ByteArrayType>,
+   Status DecodeArrow(int num_values, int null_count, const uint8_t* valid_bits,
+                      int64_t valid_bits_offset, BuilderType* builder,
+                      int* out_num_values) {
+-    constexpr int32_t buffer_size = 1024;
+-    int32_t indices_buffer[buffer_size];
++    constexpr int32_t kBufferSize = 1024;
++    int32_t indices[kBufferSize];
+ 
+     RETURN_NOT_OK(builder->Reserve(num_values));
+     arrow::internal::BitmapReader bit_reader(valid_bits, valid_bits_offset, num_values);
+@@ -2059,14 +2084,16 @@ class DictByteArrayDecoderImpl : public DictDecoderImpl<ByteArrayType>,
+ 
+       if (is_valid) {
+         int32_t batch_size =
+-            std::min<int32_t>(buffer_size, num_values - num_appended - null_count);
+-        int num_indices = idx_decoder_.GetBatch(indices_buffer, batch_size);
++            std::min<int32_t>(kBufferSize, num_values - num_appended - null_count);
++        int num_indices = idx_decoder_.GetBatch(indices, batch_size);
+ 
+         int i = 0;
+         while (true) {
+           // Consume all indices
+           if (is_valid) {
+-            const auto& val = dict_values[indices_buffer[i]];
++            auto idx = indices[i];
++            RETURN_NOT_OK(IndexInBounds(idx));
++            const auto& val = dict_values[idx];
+             RETURN_NOT_OK(builder->Append(val.ptr, val.len));
+             ++i;
+             ++values_decoded;
+@@ -2095,19 +2122,22 @@ class DictByteArrayDecoderImpl : public DictDecoderImpl<ByteArrayType>,
+ 
+   template <typename BuilderType>
+   Status DecodeArrowNonNull(int num_values, BuilderType* builder, int* out_num_values) {
+-    constexpr int32_t buffer_size = 2048;
+-    int32_t indices_buffer[buffer_size];
+-    int values_decoded = 0;
++    constexpr int32_t kBufferSize = 2048;
++    int32_t indices[kBufferSize];
++
+     RETURN_NOT_OK(builder->Reserve(num_values));
+ 
+     auto dict_values = reinterpret_cast<const ByteArray*>(dictionary_->data());
+ 
++    int values_decoded = 0;
+     while (values_decoded < num_values) {
+-      int32_t batch_size = std::min<int32_t>(buffer_size, num_values - values_decoded);
+-      int num_indices = idx_decoder_.GetBatch(indices_buffer, batch_size);
++      int32_t batch_size = std::min<int32_t>(kBufferSize, num_values - values_decoded);
++      int num_indices = idx_decoder_.GetBatch(indices, batch_size);
+       if (num_indices == 0) ParquetException::EofException();
+       for (int i = 0; i < num_indices; ++i) {
+-        const auto& val = dict_values[indices_buffer[i]];
++        auto idx = indices[i];
++        RETURN_NOT_OK(IndexInBounds(idx));
++        const auto& val = dict_values[idx];
+         RETURN_NOT_OK(builder->Append(val.ptr, val.len));
+       }
+       values_decoded += num_indices;
+@@ -2173,7 +2203,8 @@ class DeltaBitPackDecoder : public DecoderImpl, virtual public TypedDecoder<DTyp
+ 
+  private:
+   void InitBlock() {
+-    int32_t block_size;
++    // The number of values per block.
++    uint32_t block_size;
+     if (!decoder_.GetVlqInt(&block_size)) ParquetException::EofException();
+     if (!decoder_.GetVlqInt(&num_mini_blocks_)) ParquetException::EofException();
+     if (!decoder_.GetVlqInt(&values_current_block_)) {
+@@ -2185,7 +2216,7 @@ class DeltaBitPackDecoder : public DecoderImpl, virtual public TypedDecoder<DTyp
+     uint8_t* bit_width_data = delta_bit_widths_->mutable_data();
+ 
+     if (!decoder_.GetZigZagVlqInt(&min_delta_)) ParquetException::EofException();
+-    for (int i = 0; i < num_mini_blocks_; ++i) {
++    for (uint32_t i = 0; i < num_mini_blocks_; ++i) {
+       if (!decoder_.GetAligned<uint8_t>(1, bit_width_data + i)) {
+         ParquetException::EofException();
+       }
+@@ -2227,8 +2258,8 @@ class DeltaBitPackDecoder : public DecoderImpl, virtual public TypedDecoder<DTyp
+ 
+   MemoryPool* pool_;
+   arrow::BitUtil::BitReader decoder_;
+-  int32_t values_current_block_;
+-  int32_t num_mini_blocks_;
++  uint32_t values_current_block_;
++  uint32_t num_mini_blocks_;
+   uint64_t values_per_mini_block_;
+   uint64_t values_current_mini_block_;
+ 
+diff --git a/cpp/src/parquet/file_reader.cc b/cpp/src/parquet/file_reader.cc
+index b5b63b9f20..167321cab4 100644
+--- a/cpp/src/parquet/file_reader.cc
++++ b/cpp/src/parquet/file_reader.cc
+@@ -132,6 +132,10 @@ class SerializedRowGroup : public RowGroupReader::Contents {
+                               properties_.memory_pool());
+     }
+ 
++    if (file_decryptor_ == nullptr) {
++      throw ParquetException("RowGroup is noted as encrypted but no file decryptor");
++    }
++
+     // The column is encrypted
+     std::shared_ptr<Decryptor> meta_decryptor;
+     std::shared_ptr<Decryptor> data_decryptor;
+@@ -290,7 +294,7 @@ void SerializedFile::ParseUnencryptedFileMetadata(
+       reinterpret_cast<const uint8_t*>(footer_buffer->data()) + footer_read_size -
+       kFooterSize);
+   int64_t metadata_start = source_size_ - kFooterSize - *metadata_len;
+-  if (kFooterSize + *metadata_len > source_size_) {
++  if (*metadata_len > source_size_ - kFooterSize) {
+     throw ParquetInvalidOrCorruptedFileException(
+         "Parquet file size is ", source_size_,
+         " bytes, smaller than the size reported by metadata (", metadata_len, "bytes)");
+diff --git a/testing b/testing
+index 5ebe03165f..56f6f7a520 160000
+--- a/testing
++++ b/testing
+@@ -1 +1 @@
+-Subproject commit 5ebe03165fc41061e253479798816fe4da111cde
++Subproject commit 56f6f7a520330fbc0c328b678da79c7973df8865
+-- 
+2.49.0
+

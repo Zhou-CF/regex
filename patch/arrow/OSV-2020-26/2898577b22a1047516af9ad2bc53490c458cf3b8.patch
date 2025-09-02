@@ -1,0 +1,96 @@
+From 2898577b22a1047516af9ad2bc53490c458cf3b8 Mon Sep 17 00:00:00 2001
+From: Antoine Pitrou <antoine@python.org>
+Date: Mon, 6 Apr 2020 17:13:18 -0500
+Subject: [PATCH] PARQUET-1835: [C++] Fix crashes on invalid input
+
+Will hopefully fix the following issues:
+* https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=21377
+* https://bugs.chromium.org/p/oss-fuzz/issues/detail?id=21567
+
+Closes #6848 from pitrou/PARQUET-1835-oss-fuzz
+
+Authored-by: Antoine Pitrou <antoine@python.org>
+Signed-off-by: Wes McKinney <wesm+git@apache.org>
+---
+ cpp/src/parquet/column_reader.cc |  6 +++++-
+ cpp/src/parquet/encoding.cc      | 12 ++++++------
+ testing                          |  2 +-
+ 3 files changed, 12 insertions(+), 8 deletions(-)
+
+diff --git a/cpp/src/parquet/column_reader.cc b/cpp/src/parquet/column_reader.cc
+index e4dc8dc612..f746eb7e48 100644
+--- a/cpp/src/parquet/column_reader.cc
++++ b/cpp/src/parquet/column_reader.cc
+@@ -82,7 +82,7 @@ int LevelDecoder::SetData(Encoding::type encoding, int16_t max_level,
+     case Encoding::BIT_PACKED: {
+       num_bytes =
+           static_cast<int32_t>(BitUtil::BytesForBits(num_buffered_values * bit_width_));
+-      if (num_bytes > data_size) {
++      if (num_bytes < 0 || num_bytes > data_size - 4) {
+         throw ParquetException("Received invalid number of bytes (corrupt data page?)");
+       }
+       if (!bit_packed_decoder_) {
+@@ -375,6 +375,10 @@ std::shared_ptr<Page> SerializedPageReader::NextPage() {
+       if (header.num_values < 0) {
+         throw ParquetException("Invalid page header (negative number of values)");
+       }
++      if (header.definition_levels_byte_length < 0 ||
++          header.repetition_levels_byte_length < 0) {
++        throw ParquetException("Invalid page header (negative levels byte length)");
++      }
+       bool is_compressed = header.__isset.is_compressed ? header.is_compressed : false;
+       EncodedStatistics page_statistics = ExtractStatsFromHeader(header);
+       seen_num_rows_ += header.num_values;
+diff --git a/cpp/src/parquet/encoding.cc b/cpp/src/parquet/encoding.cc
+index c70d26a6f8..b123c048b1 100644
+--- a/cpp/src/parquet/encoding.cc
++++ b/cpp/src/parquet/encoding.cc
+@@ -1045,15 +1045,15 @@ int PlainDecoder<DType>::DecodeArrow(
+ template <typename T>
+ inline int DecodePlain(const uint8_t* data, int64_t data_size, int num_values,
+                        int type_length, T* out) {
+-  int bytes_to_decode = num_values * static_cast<int>(sizeof(T));
+-  if (data_size < bytes_to_decode) {
++  int64_t bytes_to_decode = num_values * static_cast<int64_t>(sizeof(T));
++  if (bytes_to_decode > data_size || bytes_to_decode > INT_MAX) {
+     ParquetException::EofException();
+   }
+   // If bytes_to_decode == 0, data could be null
+   if (bytes_to_decode > 0) {
+     memcpy(out, data, bytes_to_decode);
+   }
+-  return bytes_to_decode;
++  return static_cast<int>(bytes_to_decode);
+ }
+ 
+ template <typename DType>
+@@ -1108,8 +1108,8 @@ template <>
+ inline int DecodePlain<FixedLenByteArray>(const uint8_t* data, int64_t data_size,
+                                           int num_values, int type_length,
+                                           FixedLenByteArray* out) {
+-  int bytes_to_decode = type_length * num_values;
+-  if (data_size < bytes_to_decode) {
++  int64_t bytes_to_decode = static_cast<int64_t>(type_length) * num_values;
++  if (bytes_to_decode > data_size || bytes_to_decode > INT_MAX) {
+     ParquetException::EofException();
+   }
+   for (int i = 0; i < num_values; ++i) {
+@@ -1117,7 +1117,7 @@ inline int DecodePlain<FixedLenByteArray>(const uint8_t* data, int64_t data_size
+     data += type_length;
+     data_size -= type_length;
+   }
+-  return bytes_to_decode;
++  return static_cast<int>(bytes_to_decode);
+ }
+ 
+ template <typename DType>
+diff --git a/testing b/testing
+index 84730c2fa8..582b79a547 160000
+--- a/testing
++++ b/testing
+@@ -1 +1 @@
+-Subproject commit 84730c2fa8f3f7d0ecd79b05b38446375972ef4f
++Subproject commit 582b79a547dfe2e0fd40a245951d200d6d9c093b
+-- 
+2.49.0
+
