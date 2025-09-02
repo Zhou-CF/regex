@@ -129,7 +129,7 @@ def check_rule_py(project_name, cve_name):
     :param project_name: 项目名称
     :param cve_name: CVE名称
     """
-    save_dir = os.path.join(output_root, project_name, cve_name)
+    save_dir = os.path.join(output_root, project_name, 'rule', cve_name)
     print(f"检查目录: {save_dir}")
     if not os.path.exists(save_dir):
         return False
@@ -202,9 +202,10 @@ def main():
                         continue
                     patch_info_path = os.path.join(cve_path, patch_info)
                     deal(patch_info_path, project_name, cve_name, patch_info)
-        proj = find_project(project_name)
-        if proj:
-            shutil.copytree(os.path.join(source_root, proj), os.path.join(output_root, project_name, proj), dirs_exist_ok=True)
+        source_code_path = utils.get_source_directory(source_root, project_name)
+        proj = os.path.basename(source_code_path) if source_code_path else project_name
+        if source_code_path:
+            shutil.copytree(source_code_path, os.path.join(output_root, project_name, proj), dirs_exist_ok=True)
         shutil.copy(r'./run.py', os.path.join(output_root, project_name))
 
 def update_a_cve_res_too_much(project, cve):
@@ -214,7 +215,7 @@ def update_a_cve_res_too_much(project, cve):
     :param project_name: 项目名称
     :param cve_name: CVE名称
     """
-    check_code_path = os.path.join(output_root, project, cve)
+    check_code_path = os.path.join(output_root, project, 'rule', cve)
     if not os.path.exists(check_code_path):
         return
     code_path = os.path.join(check_code_path, 'rule.py')
@@ -257,6 +258,13 @@ def update_a_cve_res_too_much(project, cve):
     )
 
 def update_a_cve(project, cve, commit=None):
+    """
+    CVE的规则检测不到结果，进行迭代，并重新根据规则进行检查
+
+    :param project_name: 项目名称
+    :param cve_name: CVE名称
+    :param commit: 指定commit的补丁，默认不指定，一般是一个洞有多个补丁
+    """
 
     check_code_path = os.path.join(output_root, project, cve)
     print(f"检查代码路径: {check_code_path}")

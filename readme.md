@@ -9,7 +9,7 @@
 
 将项目的具体信息写入excel表中，如[cve_scan_result.xlsx](cve_scan_results.xlsx)所示
 
-要求一个项目中至少涉及3中CWE
+要求一个项目中至少涉及3类CWE，且项目的star数大于1000
 
 ### 运行
 
