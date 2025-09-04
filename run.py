@@ -46,6 +46,10 @@ def merge_json_files(input_dir, output_file):
     :param input_dir: 输入目录，包含多个JSON文件
     :param output_file: 输出文件路径
     """
+    if not os.path.exists(input_dir):
+        print(f"扫描目录不存在: {input_dir}")
+        return
+
     res = []
     for file in os.listdir(input_dir):
         file_path = os.path.join(input_dir, file)
