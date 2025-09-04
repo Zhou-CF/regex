@@ -167,8 +167,16 @@ def find_project(project):
             return proj
     return None
 
-def main():
+def main(project:str=None):
     for project_name in tqdm.tqdm(os.listdir(patch_root)):
+        if project and project_name.lower() != project.lower():
+            continue
+        else:
+            project_output_dir = os.path.join(output_root, project_name)
+            if os.path.exists(project_output_dir):
+                print(f"项目已存在，跳过处理: {project_name}")
+                continue
+
         project_path = os.path.join(patch_root, project_name)
         if not os.path.isdir(project_path):
             continue
