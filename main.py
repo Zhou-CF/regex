@@ -168,7 +168,10 @@ def find_project(project):
     return None
 
 def main(project:str=None):
-    for project_name in tqdm.tqdm(os.listdir(patch_root)):
+    project_list = os.listdir(patch_root)
+    if project:
+        project_list = [project]
+    for project_name in tqdm.tqdm(project_list):
         if project and project_name.lower() != project.lower():
             continue
         else:
@@ -324,4 +327,4 @@ def update_a_cve(project, cve, commit=None):
 
 
 if __name__ == "__main__":
-    main()
+    main('bigbluebutton')
