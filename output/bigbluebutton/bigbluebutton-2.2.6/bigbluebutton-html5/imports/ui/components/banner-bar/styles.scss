@@ -1,6 +1,0 @@
-@import "/imports/ui/stylesheets/variables/_all";
-
-.bannerTextColor {
-  @extend %text-elipsis;
-  color: var(--color-white);
-}
